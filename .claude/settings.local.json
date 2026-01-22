@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: ESP32-P4 WiFi project with HTTP server\n\n- WiFi connectivity using ESP-Hosted \\(ESP32-C6 co-processor\\)\n- Simple HTTP server with status page and JSON API\n- Waveshare ESP32-P4-WIFI6-M board setup guide\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")"
+    ]
+  }
+}
