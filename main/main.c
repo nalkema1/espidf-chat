@@ -11,6 +11,7 @@
 #include "nvs_flash.h"
 
 #include "http_server.h"
+#include "audio_init.h"
 
 static const char *TAG = "P4_WIFI";
 
@@ -33,6 +34,14 @@ static void wifi_event_handler(void *arg,
     else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+
+        // Play WiFi connected notification sound
+        esp_err_t err = audio_play_wifi_connected();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to play audio notification");
+        }
+
+        // Start HTTP server (TTS available via web interface)
         http_server_start();
     }
 }

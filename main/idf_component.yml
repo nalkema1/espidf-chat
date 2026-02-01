@@ -3,3 +3,12 @@ dependencies:
     version: "*"
   espressif/esp_hosted:
     version: "*"
+  waveshare/esp32_p4_nano:
+    version: "*"
+  chmorgan/esp-audio-player:
+    version: "1.0.*"
+    public: true
+  espressif/cjson:
+    version: "*"
+  espressif/esp_websocket_client:
+    version: "*"

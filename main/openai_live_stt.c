@@ -1,0 +1,688 @@
+/**
+ * OpenAI Realtime API Live Speech-to-Text Module
+ *
+ * Real-time audio streaming and transcription via OpenAI's Realtime API.
+ * Uses WebSocket with JSON messages and base64-encoded audio.
+ */
+
+#include "openai_live_stt.h"
+#include <string.h>
+#include <stdio.h>
+#include "esp_log.h"
+#include "esp_websocket_client.h"
+#include "esp_heap_caps.h"
+#include "esp_crt_bundle.h"
+#include "cJSON.h"
+#include "bsp_board_extra.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "mbedtls/base64.h"
+
+static const char *TAG = "openai_live_stt";
+
+// Audio configuration for OpenAI Realtime API
+// OpenAI expects 24kHz, 16-bit, mono PCM
+#define OPENAI_SAMPLE_RATE 24000
+#define OPENAI_BITS_PER_SAMPLE 16
+
+// Streaming chunk configuration
+// 100ms chunks at 24kHz, 16-bit mono = 4800 bytes
+#define CHUNK_DURATION_MS 100
+#define CHUNK_SIZE_BYTES ((OPENAI_SAMPLE_RATE * 2 * CHUNK_DURATION_MS) / 1000)
+
+// Transcript buffer size (32KB in PSRAM)
+#define TRANSCRIPT_BUFFER_SIZE (32 * 1024)
+
+// OpenAI Realtime API WebSocket URL
+#define OPENAI_WS_URL "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17"
+
+/**
+ * Module state
+ */
+typedef struct {
+    openai_live_stt_state_t state;
+    char *transcript;               // Accumulated transcript (PSRAM)
+    size_t transcript_len;          // Current transcript length
+    size_t transcript_capacity;     // Buffer capacity
+    char *error_message;            // Error message (heap allocated)
+    SemaphoreHandle_t mutex;        // Protect state access
+    esp_websocket_client_handle_t ws_client;  // WebSocket client
+    TaskHandle_t streaming_task;    // Audio streaming task handle
+    volatile bool stop_requested;   // Signal to stop streaming
+    bool session_configured;        // Session.update sent
+} openai_live_stt_context_t;
+
+static openai_live_stt_context_t s_ctx = {0};
+static bool s_initialized = false;
+
+// Forward declarations
+static void streaming_task(void *arg);
+static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
+static void parse_openai_response(const char *data, int len);
+static void send_session_update(void);
+
+/**
+ * Check if OpenAI API key is configured
+ */
+static bool is_openai_configured(void)
+{
+#ifdef CONFIG_OPENAI_API_KEY
+    return strlen(CONFIG_OPENAI_API_KEY) > 0;
+#else
+    return false;
+#endif
+}
+
+/**
+ * Initialize OpenAI Live STT module
+ */
+esp_err_t openai_live_stt_init(void)
+{
+    if (s_initialized) {
+        return ESP_OK;
+    }
+
+    if (!is_openai_configured()) {
+        ESP_LOGE(TAG, "OpenAI API key not configured. Use 'idf.py menuconfig' to set it.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Create mutex
+    s_ctx.mutex = xSemaphoreCreateMutex();
+    if (!s_ctx.mutex) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Allocate transcript buffer in PSRAM
+    s_ctx.transcript = heap_caps_calloc(1, TRANSCRIPT_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_ctx.transcript) {
+        ESP_LOGE(TAG, "Failed to allocate transcript buffer in PSRAM");
+        vSemaphoreDelete(s_ctx.mutex);
+        return ESP_ERR_NO_MEM;
+    }
+    s_ctx.transcript_capacity = TRANSCRIPT_BUFFER_SIZE;
+    s_ctx.transcript_len = 0;
+
+    s_ctx.state = OPENAI_LIVE_STT_STATE_IDLE;
+    s_initialized = true;
+
+    ESP_LOGI(TAG, "OpenAI Live STT initialized (transcript buffer: %d KB)", TRANSCRIPT_BUFFER_SIZE / 1024);
+    return ESP_OK;
+}
+
+/**
+ * Start live transcription
+ */
+esp_err_t openai_live_stt_start(void)
+{
+    if (!s_initialized) {
+        esp_err_t err = openai_live_stt_init();
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+
+    if (s_ctx.state == OPENAI_LIVE_STT_STATE_STREAMING || s_ctx.state == OPENAI_LIVE_STT_STATE_CONNECTING) {
+        xSemaphoreGive(s_ctx.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Clear previous error
+    if (s_ctx.error_message) {
+        free(s_ctx.error_message);
+        s_ctx.error_message = NULL;
+    }
+
+    s_ctx.state = OPENAI_LIVE_STT_STATE_CONNECTING;
+    s_ctx.stop_requested = false;
+    s_ctx.session_configured = false;
+
+    xSemaphoreGive(s_ctx.mutex);
+
+#ifdef CONFIG_OPENAI_API_KEY
+    // Build authorization header
+    char auth_header[256];
+    snprintf(auth_header, sizeof(auth_header), "Bearer %s", CONFIG_OPENAI_API_KEY);
+
+    // Configure WebSocket client with SSL certificate bundle
+    esp_websocket_client_config_t ws_cfg = {
+        .uri = OPENAI_WS_URL,
+        .buffer_size = 16384,  // Larger buffer for base64 audio
+        .task_stack = 8192,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+
+    s_ctx.ws_client = esp_websocket_client_init(&ws_cfg);
+    if (!s_ctx.ws_client) {
+        ESP_LOGE(TAG, "Failed to create WebSocket client");
+        xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+        s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+        s_ctx.error_message = strdup("Failed to create WebSocket client");
+        xSemaphoreGive(s_ctx.mutex);
+        return ESP_FAIL;
+    }
+
+    // Set headers
+    esp_websocket_client_append_header(s_ctx.ws_client, "Authorization", auth_header);
+    esp_websocket_client_append_header(s_ctx.ws_client, "OpenAI-Beta", "realtime=v1");
+
+    // Register event handler
+    esp_websocket_register_events(s_ctx.ws_client, WEBSOCKET_EVENT_ANY, websocket_event_handler, NULL);
+
+    // Start WebSocket connection
+    esp_err_t err = esp_websocket_client_start(s_ctx.ws_client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start WebSocket client: %s", esp_err_to_name(err));
+        esp_websocket_client_destroy(s_ctx.ws_client);
+        s_ctx.ws_client = NULL;
+        xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+        s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+        s_ctx.error_message = strdup("Failed to connect to OpenAI");
+        xSemaphoreGive(s_ctx.mutex);
+        return err;
+    }
+
+    ESP_LOGI(TAG, "Connecting to OpenAI Realtime API...");
+    return ESP_OK;
+#else
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+    s_ctx.error_message = strdup("OpenAI API key not configured");
+    xSemaphoreGive(s_ctx.mutex);
+    return ESP_ERR_INVALID_STATE;
+#endif
+}
+
+/**
+ * Stop live transcription
+ */
+esp_err_t openai_live_stt_stop(void)
+{
+    if (!s_initialized) {
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+
+    if (s_ctx.state != OPENAI_LIVE_STT_STATE_STREAMING && s_ctx.state != OPENAI_LIVE_STT_STATE_CONNECTING) {
+        xSemaphoreGive(s_ctx.mutex);
+        return ESP_OK;
+    }
+
+    s_ctx.stop_requested = true;
+    xSemaphoreGive(s_ctx.mutex);
+
+    // Wait for streaming task to finish
+    if (s_ctx.streaming_task) {
+        for (int i = 0; i < 50; i++) {  // Wait up to 5 seconds
+            if (s_ctx.streaming_task == NULL) break;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    // Close WebSocket
+    if (s_ctx.ws_client) {
+        esp_websocket_client_stop(s_ctx.ws_client);
+        esp_websocket_client_destroy(s_ctx.ws_client);
+        s_ctx.ws_client = NULL;
+    }
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    s_ctx.state = OPENAI_LIVE_STT_STATE_IDLE;
+    xSemaphoreGive(s_ctx.mutex);
+
+    ESP_LOGI(TAG, "OpenAI Live STT stopped");
+    return ESP_OK;
+}
+
+/**
+ * Get current status
+ */
+esp_err_t openai_live_stt_get_status(openai_live_stt_status_t *status)
+{
+    if (!status) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_initialized) {
+        status->state = OPENAI_LIVE_STT_STATE_IDLE;
+        status->transcript = NULL;
+        status->error_message = NULL;
+        return ESP_OK;
+    }
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    status->state = s_ctx.state;
+    status->transcript = (s_ctx.transcript_len > 0) ? s_ctx.transcript : NULL;
+    status->error_message = s_ctx.error_message;
+    xSemaphoreGive(s_ctx.mutex);
+
+    return ESP_OK;
+}
+
+/**
+ * Get current state
+ */
+openai_live_stt_state_t openai_live_stt_get_state(void)
+{
+    if (!s_initialized) {
+        return OPENAI_LIVE_STT_STATE_IDLE;
+    }
+    return s_ctx.state;
+}
+
+/**
+ * Get accumulated transcript
+ */
+const char *openai_live_stt_get_transcript(void)
+{
+    if (!s_initialized || s_ctx.transcript_len == 0) {
+        return NULL;
+    }
+    return s_ctx.transcript;
+}
+
+/**
+ * Clear accumulated transcript
+ */
+void openai_live_stt_clear_transcript(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    if (s_ctx.transcript) {
+        s_ctx.transcript[0] = '\0';
+        s_ctx.transcript_len = 0;
+    }
+    xSemaphoreGive(s_ctx.mutex);
+}
+
+/**
+ * Check if busy
+ */
+bool openai_live_stt_is_busy(void)
+{
+    if (!s_initialized) {
+        return false;
+    }
+    return s_ctx.state == OPENAI_LIVE_STT_STATE_STREAMING || s_ctx.state == OPENAI_LIVE_STT_STATE_CONNECTING;
+}
+
+/**
+ * Cleanup
+ */
+void openai_live_stt_cleanup(void)
+{
+    if (!s_initialized) {
+        return;
+    }
+
+    openai_live_stt_stop();
+
+    if (s_ctx.transcript) {
+        heap_caps_free(s_ctx.transcript);
+        s_ctx.transcript = NULL;
+    }
+
+    if (s_ctx.error_message) {
+        free(s_ctx.error_message);
+        s_ctx.error_message = NULL;
+    }
+
+    if (s_ctx.mutex) {
+        vSemaphoreDelete(s_ctx.mutex);
+        s_ctx.mutex = NULL;
+    }
+
+    s_initialized = false;
+    ESP_LOGI(TAG, "OpenAI Live STT cleaned up");
+}
+
+/**
+ * Send session.update to configure transcription
+ */
+static void send_session_update(void)
+{
+    // Configure session for audio input with transcription
+    const char *session_update = "{"
+        "\"type\": \"session.update\","
+        "\"session\": {"
+            "\"modalities\": [\"text\"],"
+            "\"input_audio_format\": \"pcm16\","
+            "\"input_audio_transcription\": {"
+                "\"model\": \"whisper-1\""
+            "},"
+            "\"turn_detection\": {"
+                "\"type\": \"server_vad\","
+                "\"threshold\": 0.5,"
+                "\"prefix_padding_ms\": 300,"
+                "\"silence_duration_ms\": 500"
+            "}"
+        "}"
+    "}";
+
+    int sent = esp_websocket_client_send_text(s_ctx.ws_client, session_update, strlen(session_update), pdMS_TO_TICKS(5000));
+    if (sent < 0) {
+        ESP_LOGE(TAG, "Failed to send session.update");
+    } else {
+        ESP_LOGI(TAG, "Sent session.update");
+        s_ctx.session_configured = true;
+    }
+}
+
+/**
+ * WebSocket event handler
+ */
+static void websocket_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
+
+    switch (event_id) {
+        case WEBSOCKET_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "WebSocket connected to OpenAI");
+
+            // Send session configuration
+            send_session_update();
+
+            xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+            s_ctx.state = OPENAI_LIVE_STT_STATE_STREAMING;
+            xSemaphoreGive(s_ctx.mutex);
+
+            // Start audio streaming task
+            BaseType_t ret = xTaskCreate(streaming_task, "openai_live_stream", 16384, NULL, 5, &s_ctx.streaming_task);
+            if (ret != pdPASS) {
+                ESP_LOGE(TAG, "Failed to create streaming task");
+                xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+                s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+                s_ctx.error_message = strdup("Failed to start audio streaming");
+                xSemaphoreGive(s_ctx.mutex);
+            }
+            break;
+
+        case WEBSOCKET_EVENT_DISCONNECTED:
+            ESP_LOGI(TAG, "WebSocket disconnected");
+            xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+            if (s_ctx.state == OPENAI_LIVE_STT_STATE_STREAMING) {
+                s_ctx.stop_requested = true;
+            }
+            if (!s_ctx.stop_requested) {
+                s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+                if (!s_ctx.error_message) {
+                    s_ctx.error_message = strdup("Connection lost");
+                }
+            } else {
+                s_ctx.state = OPENAI_LIVE_STT_STATE_IDLE;
+            }
+            xSemaphoreGive(s_ctx.mutex);
+            break;
+
+        case WEBSOCKET_EVENT_DATA:
+            if (data->op_code == 0x01) {  // Text frame
+                ESP_LOGD(TAG, "Received: %.*s", data->data_len, (char *)data->data_ptr);
+                parse_openai_response((const char *)data->data_ptr, data->data_len);
+            }
+            break;
+
+        case WEBSOCKET_EVENT_ERROR:
+            ESP_LOGE(TAG, "WebSocket error");
+            xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+            s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+            if (!s_ctx.error_message) {
+                s_ctx.error_message = strdup("WebSocket error");
+            }
+            xSemaphoreGive(s_ctx.mutex);
+            break;
+
+        default:
+            break;
+    }
+}
+
+/**
+ * Parse OpenAI Realtime API JSON response
+ */
+static void parse_openai_response(const char *data, int len)
+{
+    // Make a null-terminated copy
+    char *json_str = malloc(len + 1);
+    if (!json_str) {
+        return;
+    }
+    memcpy(json_str, data, len);
+    json_str[len] = '\0';
+
+    cJSON *root = cJSON_Parse(json_str);
+    free(json_str);
+
+    if (!root) {
+        ESP_LOGW(TAG, "Failed to parse OpenAI response");
+        return;
+    }
+
+    // Get event type
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    if (!type || !cJSON_IsString(type)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *event_type = type->valuestring;
+
+    // Handle error events
+    if (strcmp(event_type, "error") == 0) {
+        cJSON *error = cJSON_GetObjectItem(root, "error");
+        if (error) {
+            cJSON *message = cJSON_GetObjectItem(error, "message");
+            if (message && cJSON_IsString(message)) {
+                ESP_LOGE(TAG, "OpenAI error: %s", message->valuestring);
+                xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+                if (s_ctx.error_message) free(s_ctx.error_message);
+                s_ctx.error_message = strdup(message->valuestring);
+                s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+                xSemaphoreGive(s_ctx.mutex);
+            }
+        }
+        cJSON_Delete(root);
+        return;
+    }
+
+    // Handle session events
+    if (strcmp(event_type, "session.created") == 0 || strcmp(event_type, "session.updated") == 0) {
+        ESP_LOGI(TAG, "Session event: %s", event_type);
+        cJSON_Delete(root);
+        return;
+    }
+
+    // Handle transcription events
+    // conversation.item.input_audio_transcription.completed contains final transcription
+    if (strcmp(event_type, "conversation.item.input_audio_transcription.completed") == 0) {
+        cJSON *transcript = cJSON_GetObjectItem(root, "transcript");
+        if (transcript && cJSON_IsString(transcript) && strlen(transcript->valuestring) > 0) {
+            const char *text = transcript->valuestring;
+            size_t text_len = strlen(text);
+
+            xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+
+            // Add space before new text if not at start
+            if (s_ctx.transcript_len > 0 && s_ctx.transcript_len + 1 < s_ctx.transcript_capacity) {
+                s_ctx.transcript[s_ctx.transcript_len] = ' ';
+                s_ctx.transcript_len++;
+            }
+
+            // Append text
+            size_t copy_len = text_len;
+            if (s_ctx.transcript_len + copy_len >= s_ctx.transcript_capacity) {
+                copy_len = s_ctx.transcript_capacity - s_ctx.transcript_len - 1;
+            }
+
+            if (copy_len > 0) {
+                memcpy(s_ctx.transcript + s_ctx.transcript_len, text, copy_len);
+                s_ctx.transcript_len += copy_len;
+                s_ctx.transcript[s_ctx.transcript_len] = '\0';
+                ESP_LOGI(TAG, "Transcript: %s", text);
+            }
+
+            xSemaphoreGive(s_ctx.mutex);
+        }
+    }
+
+    // Handle input audio buffer speech events for logging
+    if (strcmp(event_type, "input_audio_buffer.speech_started") == 0) {
+        ESP_LOGI(TAG, "Speech detected");
+    } else if (strcmp(event_type, "input_audio_buffer.speech_stopped") == 0) {
+        ESP_LOGI(TAG, "Speech ended");
+    }
+
+    cJSON_Delete(root);
+}
+
+/**
+ * Base64 encode helper
+ */
+static int base64_encode_audio(const uint8_t *input, size_t input_len, char *output, size_t output_size)
+{
+    size_t olen = 0;
+    int ret = mbedtls_base64_encode((unsigned char *)output, output_size, &olen, input, input_len);
+    if (ret != 0) {
+        return -1;
+    }
+    return (int)olen;
+}
+
+/**
+ * Audio streaming task - reads from microphone and sends to WebSocket
+ */
+static void streaming_task(void *arg)
+{
+    ESP_LOGI(TAG, "Streaming task started");
+
+    // Wait for session to be configured
+    int timeout = 50;  // 5 seconds
+    while (!s_ctx.session_configured && timeout > 0) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        timeout--;
+    }
+
+    if (!s_ctx.session_configured) {
+        ESP_LOGE(TAG, "Session not configured");
+        xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+        s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+        s_ctx.error_message = strdup("Session configuration timeout");
+        s_ctx.streaming_task = NULL;
+        xSemaphoreGive(s_ctx.mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Configure codec for recording (24kHz, 16-bit, stereo I2S but we extract mono)
+    esp_err_t err = bsp_extra_codec_set_fs(OPENAI_SAMPLE_RATE, OPENAI_BITS_PER_SAMPLE, I2S_SLOT_MODE_STEREO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure codec: %s", esp_err_to_name(err));
+        xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+        s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+        s_ctx.error_message = strdup("Failed to configure audio codec");
+        s_ctx.streaming_task = NULL;
+        xSemaphoreGive(s_ctx.mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Allocate buffers
+    // Stereo input = 2x mono size
+    uint8_t *stereo_chunk = heap_caps_malloc(CHUNK_SIZE_BYTES * 2, MALLOC_CAP_INTERNAL);
+    uint8_t *mono_chunk = heap_caps_malloc(CHUNK_SIZE_BYTES, MALLOC_CAP_INTERNAL);
+
+    // Base64 output is ~4/3 of input, plus JSON overhead
+    size_t base64_size = ((CHUNK_SIZE_BYTES + 2) / 3) * 4 + 1;
+    char *base64_audio = heap_caps_malloc(base64_size, MALLOC_CAP_SPIRAM);
+
+    // JSON message buffer
+    size_t json_size = base64_size + 100;
+    char *json_msg = heap_caps_malloc(json_size, MALLOC_CAP_SPIRAM);
+
+    if (!stereo_chunk || !mono_chunk || !base64_audio || !json_msg) {
+        ESP_LOGE(TAG, "Failed to allocate buffers");
+        if (stereo_chunk) heap_caps_free(stereo_chunk);
+        if (mono_chunk) heap_caps_free(mono_chunk);
+        if (base64_audio) heap_caps_free(base64_audio);
+        if (json_msg) heap_caps_free(json_msg);
+        xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+        s_ctx.state = OPENAI_LIVE_STT_STATE_ERROR;
+        s_ctx.error_message = strdup("Memory allocation failed");
+        s_ctx.streaming_task = NULL;
+        xSemaphoreGive(s_ctx.mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t chunk_count = 0;
+
+    while (!s_ctx.stop_requested && s_ctx.ws_client && esp_websocket_client_is_connected(s_ctx.ws_client)) {
+        // Read from microphone (stereo I2S data)
+        size_t bytes_read = 0;
+        err = bsp_extra_i2s_read(stereo_chunk, CHUNK_SIZE_BYTES * 2, &bytes_read, CHUNK_DURATION_MS + 50);
+
+        if (err != ESP_OK || bytes_read == 0) {
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // Convert stereo to mono (take left channel only)
+        int16_t *stereo_samples = (int16_t *)stereo_chunk;
+        int16_t *mono_samples = (int16_t *)mono_chunk;
+        size_t num_stereo_samples = bytes_read / 4;  // 4 bytes per stereo sample pair
+
+        for (size_t i = 0; i < num_stereo_samples; i++) {
+            mono_samples[i] = stereo_samples[i * 2];  // Left channel
+        }
+
+        size_t mono_size = num_stereo_samples * 2;
+
+        // Encode to base64
+        int b64_len = base64_encode_audio(mono_chunk, mono_size, base64_audio, base64_size);
+        if (b64_len < 0) {
+            ESP_LOGW(TAG, "Base64 encode failed");
+            continue;
+        }
+
+        // Build JSON message for input_audio_buffer.append
+        snprintf(json_msg, json_size,
+            "{\"type\":\"input_audio_buffer.append\",\"audio\":\"%s\"}",
+            base64_audio);
+
+        // Send via WebSocket
+        int sent = esp_websocket_client_send_text(s_ctx.ws_client, json_msg, strlen(json_msg), pdMS_TO_TICKS(1000));
+        if (sent < 0) {
+            ESP_LOGW(TAG, "WebSocket send failed");
+        } else {
+            chunk_count++;
+            if ((chunk_count % 50) == 0) {  // Log every 5 seconds
+                ESP_LOGI(TAG, "Streamed %lu chunks (%.1f seconds)",
+                         (unsigned long)chunk_count, chunk_count * CHUNK_DURATION_MS / 1000.0f);
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Streaming task stopped after %lu chunks", (unsigned long)chunk_count);
+
+    heap_caps_free(stereo_chunk);
+    heap_caps_free(mono_chunk);
+    heap_caps_free(base64_audio);
+    heap_caps_free(json_msg);
+
+    xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
+    s_ctx.streaming_task = NULL;
+    xSemaphoreGive(s_ctx.mutex);
+
+    vTaskDelete(NULL);
+}

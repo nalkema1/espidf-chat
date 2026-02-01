@@ -9,3 +9,52 @@ config WIFI_PASSWORD
     default ""
 
 endmenu
+
+menu "ElevenLabs TTS Configuration"
+
+config ELEVENLABS_API_KEY
+    string "ElevenLabs API Key"
+    default ""
+    help
+        Your ElevenLabs API key. Get it from https://elevenlabs.io
+
+config ELEVENLABS_VOICE_ID
+    string "ElevenLabs Voice ID"
+    default "XrbmwOihWOLSrRLvMXGE"
+    help
+        The voice ID to use for TTS. Default is a preset voice.
+
+endmenu
+
+menu "OpenAI TTS Configuration"
+
+config OPENAI_API_KEY
+    string "OpenAI API Key"
+    default ""
+    help
+        Your OpenAI API key. Get it from https://platform.openai.com/api-keys
+
+config OPENAI_TTS_MODEL
+    string "OpenAI TTS Model"
+    default "tts-1"
+    help
+        The TTS model to use. Options: tts-1 (faster), tts-1-hd (quality), gpt-4o-mini-tts (newest)
+
+config OPENAI_TTS_VOICE
+    string "OpenAI TTS Voice"
+    default "alloy"
+    help
+        The voice to use. Options: alloy, echo, fable, onyx, nova, shimmer, coral
+
+endmenu
+
+menu "Deepgram Live STT Configuration"
+
+config DEEPGRAM_API_KEY
+    string "Deepgram API Key"
+    default ""
+    help
+        Your Deepgram API key for real-time speech-to-text.
+        Get a free key at https://console.deepgram.com
+
+endmenu
